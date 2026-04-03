@@ -172,8 +172,7 @@ class CodeToPipelineNormalizer:
                     line_index=line_index,
                 )
             if ".merge" in call_name or call_name == "pd.merge":
-                left_name = self._resolve_input_name(self._call_base_name(value))
-                right_name = self._resolve_input_name(self._extract_name(self._argument_or_keyword(value, 0, "right")))
+                left_name, right_name = self._extract_merge_inputs(value)
                 return ParsedStep(
                     operator=OperatorType.JOIN,
                     title="Join intermediate tables",
@@ -446,6 +445,25 @@ class CodeToPipelineNormalizer:
         if isinstance(target, ast.List):
             return [self._extract_name(item) for item in target.elts if self._extract_name(item)]
         return []
+
+    def _extract_merge_inputs(self, call: ast.Call) -> tuple[str | None, str | None]:
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "merge":
+            base_name = self._extract_name(call.func.value)
+            if base_name == "pd":
+                left_node = self._argument_or_keyword(call, 0, "left")
+                right_node = self._argument_or_keyword(call, 1, "right")
+            else:
+                left_node = call.func.value
+                right_node = self._argument_or_keyword(call, 0, "right")
+            left_name = self._resolve_input_name(self._extract_name(left_node))
+            right_name = self._resolve_input_name(self._extract_name(right_node))
+            return left_name, right_name
+
+        left_node = self._argument_or_keyword(call, 0, "left")
+        right_node = self._argument_or_keyword(call, 1, "right")
+        left_name = self._resolve_input_name(self._extract_name(left_node))
+        right_name = self._resolve_input_name(self._extract_name(right_node))
+        return left_name, right_name
 
     def _extract_groupby_inputs(self, call: ast.Call) -> list[str]:
         names = self._resolve_inputs(self._collect_name_inputs(call))

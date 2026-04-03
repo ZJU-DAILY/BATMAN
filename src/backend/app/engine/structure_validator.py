@@ -4,6 +4,8 @@ import ast
 from dataclasses import dataclass
 from typing import Any
 
+import pandas as pd
+
 from app.engine.utils import source_alias
 from app.models import PipelineSpec, PipelineStep, Session
 
@@ -250,12 +252,12 @@ class PipelineStructureValidator:
 
         if operator == "join":
             shared = step.params.get("on")
-            left = step.params.get("left_on") or shared or []
-            right = step.params.get("right_on") or shared or []
+            left = self._coerce_column_list(step.params.get("left_on") or shared)
+            right = self._coerce_column_list(step.params.get("right_on") or shared)
             if len(step.inputs) >= 1:
-                requirements[step.inputs[0]] = [str(item) for item in left if isinstance(item, str)]
+                requirements[step.inputs[0]] = left
             if len(step.inputs) >= 2:
-                requirements[step.inputs[1]] = [str(item) for item in right if isinstance(item, str)]
+                requirements[step.inputs[1]] = right
             return requirements
 
         if operator == "unpivot" and step.inputs:
@@ -497,21 +499,32 @@ class PipelineStructureValidator:
             right_columns = input_columns[1] if len(input_columns) > 1 else []
             left_on = step.params.get("left_on") or step.params.get("on") or []
             right_on = step.params.get("right_on") or step.params.get("on") or []
-            for key in [str(item) for item in left_on]:
+            left_keys = self._coerce_column_list(left_on)
+            right_keys = self._coerce_column_list(right_on)
+            for key in left_keys:
                 if key not in left_columns:
                     available = ", ".join(left_columns)
                     raise ValueError(
                         f'{origin} step "{step.step_id}" joins on missing left key "{key}" at line {line_index}. '
                         f"Available left columns: {available}."
                     )
-            for key in [str(item) for item in right_on]:
+            for key in right_keys:
                 if key not in right_columns:
                     available = ", ".join(right_columns)
                     raise ValueError(
                         f'{origin} step "{step.step_id}" joins on missing right key "{key}" at line {line_index}. '
                         f"Available right columns: {available}."
                     )
-            return self._unique_preserve_order(left_columns + right_columns)
+            return self._infer_join_output_columns(
+                left_columns=left_columns,
+                right_columns=right_columns,
+                left_on=left_keys,
+                right_on=right_keys,
+                how=step.params.get("how"),
+                origin=origin,
+                step_id=step.step_id,
+                line_index=line_index,
+            )
 
         if step.operator.value in {"union", "pivot", "unpivot"}:
             return list(primary_columns)
@@ -550,6 +563,42 @@ class PipelineStructureValidator:
             return list(primary_columns)
 
         return list(primary_columns)
+
+    def _coerce_column_list(self, value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple)):
+            return [str(item) for item in value if isinstance(item, str)]
+        return []
+
+    def _infer_join_output_columns(
+        self,
+        *,
+        left_columns: list[str],
+        right_columns: list[str],
+        left_on: list[str],
+        right_on: list[str],
+        how: Any,
+        origin: str,
+        step_id: str,
+        line_index: int,
+    ) -> list[str]:
+        try:
+            left_df = pd.DataFrame(columns=left_columns)
+            right_df = pd.DataFrame(columns=right_columns)
+            merge_kwargs: dict[str, Any] = {
+                "how": how if isinstance(how, str) and how else "left",
+                "suffixes": ("_left", "_right"),
+            }
+            if left_on and right_on:
+                merge_kwargs["left_on"] = left_on
+                merge_kwargs["right_on"] = right_on
+            merged = left_df.merge(right_df, **merge_kwargs)
+        except Exception as exc:
+            raise ValueError(
+                f'{origin} step "{step_id}" has invalid join settings at line {line_index}: {exc}.'
+            ) from exc
+        return [str(column) for column in merged.columns]
 
     def _legacy_alias_map(self, session: Session) -> dict[str, str]:
         alias_map: dict[str, str] = {}

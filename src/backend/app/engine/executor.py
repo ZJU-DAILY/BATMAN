@@ -16,16 +16,21 @@ def _execute_raw_with_previews(spec_payload: dict[str, Any], source_map: dict[st
     tables: dict[str, pd.DataFrame] = {name: pd.read_csv(path) for name, path in source_map.items()}
     env = {"pd": pd, **{name: frame.copy() for name, frame in tables.items()}}
     snapshots: dict[int, dict[str, pd.DataFrame]] = {}
+    before_columns_by_line: dict[int, dict[str, list[str]]] = {}
 
     for index, line in enumerate(spec_payload.get("raw_code_lines", []), start=1):
         line = line.strip()
         if not line:
             continue
+        before_columns_by_line[index] = {
+            key: value.columns.tolist()
+            for key, value in env.items()
+            if isinstance(value, pd.DataFrame)
+        }
         exec(line, env)
         snapshots[index] = {key: value.copy() for key, value in env.items() if isinstance(value, pd.DataFrame)}
 
     previews: list[dict[str, Any]] = []
-    previous_by_output: dict[str, pd.DataFrame] = {}
     for raw_step in spec_payload["steps"]:
         line_index = raw_step.get("params", {}).get("_code_line_index")
         output_table = raw_step["output"]
@@ -33,7 +38,10 @@ def _execute_raw_with_previews(spec_payload: dict[str, Any], source_map: dict[st
         result = snapshot.get(output_table)
         if result is None:
             continue
-        before_columns = previous_by_output.get(output_table, pd.DataFrame()).columns.tolist()
+        before_columns: list[str] = []
+        if raw_step["inputs"]:
+            input_name = raw_step["inputs"][0]
+            before_columns = before_columns_by_line.get(line_index, {}).get(input_name, [])
         after_columns = result.columns.tolist()
         previews.append(
             {
@@ -51,7 +59,6 @@ def _execute_raw_with_previews(spec_payload: dict[str, Any], source_map: dict[st
                 "warnings": [],
             }
         )
-        previous_by_output[output_table] = result.copy()
 
     final_df = compiler.execute_raw_code(spec_payload.get("raw_code_lines", []), tables)
     return {

@@ -1,5 +1,17 @@
 export type DataType = "STRING" | "INTEGER" | "FLOAT" | "DATE" | "DATETIME" | "BOOLEAN";
 export type ExplanationDetail = "Brief" | "Standard" | "Detailed";
+export type OperatorType =
+  | "source_table"
+  | "rename"
+  | "join"
+  | "union"
+  | "groupby"
+  | "pivot"
+  | "unpivot"
+  | "date_formatting"
+  | "column_arithmetic"
+  | "add_columns"
+  | "drop_columns";
 export type SessionStatus =
   | "draft"
   | "ready_for_generation"
@@ -137,13 +149,49 @@ export interface CandidatePipeline {
   node_assessments: NodeAssessment[];
   created_at: string;
   source: string;
+  parent_candidate_id?: string | null;
 }
 
-export interface FeedbackItem {
+export interface PipelineOutlineItem {
+  step_id: string;
+  title: string;
+  operator: OperatorType;
+  inputs: string[];
+  output_table: string;
+  row_count?: number | null;
+  columns: string[];
+  added_columns: string[];
+  removed_columns: string[];
+  renamed_columns: Record<string, string>;
+}
+
+export interface ReviewSnapshot {
+  candidate_id: string;
+  candidate_source: string;
+  summary: string;
+  selected_node_id: string;
+  selected_node_assessment?: NodeAssessment | null;
+  selected_node_warning_items: WarningItem[];
+  selected_step_preview?: StepPreview | null;
+  pipeline_outline: PipelineOutlineItem[];
+  final_preview_rows: Record<string, unknown>[];
+  validation_summary: ValidationSummary;
+}
+
+export type RevisionStatus = "pending" | "applied" | "failed";
+
+export interface RevisionRecord {
   id: string;
   text: string;
-  candidate_id: string;
+  node_id: string;
+  base_candidate_id: string;
+  revised_candidate_id?: string | null;
+  status: RevisionStatus;
+  before_snapshot: ReviewSnapshot;
+  after_snapshot?: ReviewSnapshot | null;
   created_at: string;
+  completed_at?: string | null;
+  error?: string | null;
 }
 
 export interface Session {
@@ -163,7 +211,7 @@ export interface Session {
   candidates: CandidatePipeline[];
   selected_candidate_id?: string | null;
   accepted_candidate_id?: string | null;
-  feedback_history: FeedbackItem[];
+  revision_history: RevisionRecord[];
   last_error: string;
   has_samples: boolean;
 }

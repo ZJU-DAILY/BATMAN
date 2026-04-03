@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any
 
+from app.config import settings
 from app.models import CandidatePipeline, Session
 from app.services.llm_client import llm_client
 
@@ -21,6 +22,7 @@ class InteractiveSuggestionService:
         prompt = self._prompt(session, candidate, node_id, trimmed)
         response = await llm_client.complete_text(
             prompt=prompt,
+            model=settings.explanation_model,
             temperature=max(0.1, session.settings.bat_temperature),
             top_p=session.settings.bat_top_p,
             system_prompt=(

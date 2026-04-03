@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from app.config import settings
 from app.models import CandidatePipeline, ExplanationDetail, NodeAssessment, NodeStatus, Session
 from app.services.llm_client import llm_client
 
@@ -62,6 +63,7 @@ class ExplanationService:
 
         response = await llm_client.complete_text(
             prompt=self._node_explanations_prompt(session, candidate, detail),
+            model=settings.explanation_model,
             temperature=max(0.05, session.settings.bat_temperature),
             top_p=session.settings.bat_top_p,
             system_prompt=(

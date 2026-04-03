@@ -12,11 +12,6 @@ class Settings:
     api_key: str = os.getenv("ADP_API_KEY", "").strip()
     generation_model: str = os.getenv("ADP_GENERATION_MODEL", "qwen/qwen-2.5-coder-32b-instruct").strip()
     explanation_model: str = os.getenv("ADP_EXPLANATION_MODEL", "qwen/qwen-2.5-coder-32b-instruct").strip()
-    fallback_models: tuple[str, ...] = tuple(
-        item.strip()
-        for item in os.getenv("ADP_FALLBACK_MODELS", "qwen/qwen-2.5-7b-instruct").split(",")
-        if item.strip()
-    )
     max_completion_tokens: int = int(os.getenv("ADP_MAX_COMPLETION_TOKENS", "1200"))
     timeout_seconds: int = int(os.getenv("ADP_TIMEOUT_SECONDS", "45"))
     generation_max_attempts: int = int(os.getenv("ADP_GENERATION_MAX_ATTEMPTS", "3"))
@@ -25,9 +20,6 @@ class Settings:
     session_root: Path = Path(
         os.getenv("ADP_SESSION_ROOT", Path(tempfile.gettempdir()) / "adp_demo_sessions")
     )
-    @property
-    def effective_explanation_model(self) -> str:
-        return self.explanation_model or self.generation_model
 
     @property
     def llm_enabled(self) -> bool:

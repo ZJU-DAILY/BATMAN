@@ -129,7 +129,8 @@ function clampScale(scale: number) {
 
 
 function estimateNodeWidth(label: string) {
-    const estimated = Math.ceil(label.length * 15 + 90);
+  const estimated = Math.ceil(label.length * 15 + 90);
+  return Math.min(NODE_MAX_WIDTH, Math.max(NODE_MIN_WIDTH, estimated));
 }
 
 function buildCanvasMetrics(nodes: CanvasNodeItem[], edges: CanvasEdge[]) {
@@ -863,9 +864,17 @@ export default function ReviewPage() {
     () => warningItems.filter((item) => item.node_ids.some((nodeId) => selectedNodeCoveredIds.has(nodeId))),
     [selectedNodeCoveredIds, warningItems]
   );
+  const selectedNodeEditableStepId = selectedNode?.kind === "step" ? selectedNode.editableStepId : null;
 
   useEffect(() => {
-    if (!session || !selectedCandidate || !selectedNode || !feedbackText.trim() || !isFeedbackFocused || isRefreshingPreview) {
+    if (
+      !session ||
+      !selectedCandidate ||
+      !selectedNodeEditableStepId ||
+      !feedbackText.trim() ||
+      !isFeedbackFocused ||
+      isRefreshingPreview
+    ) {
       setLiveSuggestions([]);
       setSuggestionStatus("idle");
       return;
@@ -877,7 +886,7 @@ export default function ReviewPage() {
         const response = await fetchLiveSuggestions(
           session.id,
           selectedCandidate.id,
-          selectedNode.anchorStepId ?? selectedNode.id,
+          selectedNodeEditableStepId,
           feedbackText
         );
         setLiveSuggestions(response.suggestions);
@@ -889,14 +898,14 @@ export default function ReviewPage() {
     }, 3000);
 
     return () => window.clearTimeout(handle);
-  }, [feedbackText, isFeedbackFocused, isRefreshingPreview, selectedCandidate, selectedNode, session]);
+  }, [feedbackText, isFeedbackFocused, isRefreshingPreview, selectedCandidate, selectedNodeEditableStepId, session]);
 
   const suggestionCompletions = useMemo(
     () => liveSuggestions.map((item) => completionSuffix(feedbackText, item)).filter((item) => item.trim().length > 0),
     [feedbackText, liveSuggestions]
   );
 
-  const showSuggestionMenu = isFeedbackFocused && feedbackText.trim().length > 0;
+  const showSuggestionMenu = Boolean(selectedNodeEditableStepId) && isFeedbackFocused && feedbackText.trim().length > 0;
   const showGeneratingScene =
     isRefreshingPreview || (((session?.status === "generating" || session?.status === "revising") && !selectedCandidate));
   const loadingMode: "generate" | "revise" = session?.status === "revising" ? "revise" : "generate";
@@ -923,7 +932,7 @@ export default function ReviewPage() {
   };
 
   const updatePipeline = () => {
-    if (!session || !selectedCandidate || !selectedNode || !feedbackText.trim()) return;
+    if (!session || !selectedCandidate || !selectedNodeEditableStepId || !feedbackText.trim()) return;
     startTransition(async () => {
       try {
         setError("");
@@ -939,7 +948,7 @@ export default function ReviewPage() {
         const summary = await submitFeedback(
           session.id,
           selectedCandidate.id,
-          selectedNode.anchorStepId ?? selectedNode.id,
+          selectedNodeEditableStepId,
           feedbackText
         );
         setSession(summary.session);
@@ -1015,61 +1024,67 @@ export default function ReviewPage() {
                 </div>
               ) : null}
 
-              <div className="px-5 py-4">
-                <div className="text-sm font-semibold text-slate-900">Suggest a change</div>
-                <p className="mt-2 text-sm leading-6 text-slate-500">
-                  Describe the correction in everyday language and the system will revise this step from here.
-                </p>
+              {selectedNodeEditableStepId ? (
+                <div className="px-5 py-4">
+                  <div className="text-sm font-semibold text-slate-900">Suggest a change</div>
+                  <p className="mt-2 text-sm leading-6 text-slate-500">
+                    Describe the correction in everyday language and the system will revise this step from here.
+                  </p>
 
-                <div className="relative mt-4">
-                  <div className="flex items-center gap-3">
-                    <input
-                      className="field flex-1 rounded-full"
-                      placeholder="Describe what to change in this step"
-                      disabled={isPending || isRefreshingPreview}
-                      value={feedbackText}
-                      onBlur={() => window.setTimeout(() => setIsFeedbackFocused(false), 120)}
-                      onChange={(event) => {
-                        setFeedbackText(event.target.value);
-                        setIsFeedbackFocused(true);
-                        setSuggestionStatus("idle");
-                      }}
-                      onFocus={() => setIsFeedbackFocused(true)}
-                    />
-                    <button className="primary-button" disabled={isPending || isRefreshingPreview || !feedbackText.trim()} onClick={updatePipeline}>
-                      Update
-                    </button>
-                  </div>
-
-                  {showSuggestionMenu ? (
-                    <div className="mt-3 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
-                      {suggestionStatus === "loading" ? (
-                        <div className="px-4 py-3 text-sm text-slate-500">Generating completions...</div>
-                      ) : suggestionCompletions.length ? (
-                        suggestionCompletions.map((item) => (
-                          <button
-                            key={`popover-${feedbackText}-${item}`}
-                            className="block w-full border-b border-slate-200 px-4 py-3 text-left text-sm text-slate-700 transition last:border-b-0 hover:bg-slate-50"
-                            onMouseDown={(event) => event.preventDefault()}
-                            onClick={() => {
-                              setFeedbackText((current) => `${current}${item}`);
-                              setIsFeedbackFocused(true);
-                              setLiveSuggestions([]);
-                              setSuggestionStatus("idle");
-                            }}
-                            type="button"
-                          >
-                            <span className="text-slate-400">{feedbackText}</span>
-                            <span>{item}</span>
-                          </button>
-                        ))
-                      ) : (
-                        <div className="px-4 py-3 text-sm text-slate-500">Pause typing for 3 seconds to generate completions.</div>
-                      )}
+                  <div className="relative mt-4">
+                    <div className="flex items-center gap-3">
+                      <input
+                        className="field flex-1 rounded-full"
+                        placeholder="Describe what to change in this step"
+                        disabled={isPending || isRefreshingPreview}
+                        value={feedbackText}
+                        onBlur={() => window.setTimeout(() => setIsFeedbackFocused(false), 120)}
+                        onChange={(event) => {
+                          setFeedbackText(event.target.value);
+                          setIsFeedbackFocused(true);
+                          setSuggestionStatus("idle");
+                        }}
+                        onFocus={() => setIsFeedbackFocused(true)}
+                      />
+                      <button className="primary-button" disabled={isPending || isRefreshingPreview || !feedbackText.trim()} onClick={updatePipeline}>
+                        Update
+                      </button>
                     </div>
-                  ) : null}
+
+                    {showSuggestionMenu ? (
+                      <div className="mt-3 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+                        {suggestionStatus === "loading" ? (
+                          <div className="px-4 py-3 text-sm text-slate-500">Generating completions...</div>
+                        ) : suggestionCompletions.length ? (
+                          suggestionCompletions.map((item) => (
+                            <button
+                              key={`popover-${feedbackText}-${item}`}
+                              className="block w-full border-b border-slate-200 px-4 py-3 text-left text-sm text-slate-700 transition last:border-b-0 hover:bg-slate-50"
+                              onMouseDown={(event) => event.preventDefault()}
+                              onClick={() => {
+                                setFeedbackText((current) => `${current}${item}`);
+                                setIsFeedbackFocused(true);
+                                setLiveSuggestions([]);
+                                setSuggestionStatus("idle");
+                              }}
+                              type="button"
+                            >
+                              <span className="text-slate-400">{feedbackText}</span>
+                              <span>{item}</span>
+                            </button>
+                          ))
+                        ) : (
+                          <div className="px-4 py-3 text-sm text-slate-500">Pause typing for 3 seconds to generate completions.</div>
+                        )}
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
-              </div>
+              ) : (
+                <div className="px-5 py-4 text-sm leading-6 text-slate-500">
+                  This node is read-only. You can inspect its preview and explanation, but only transformation steps can be revised.
+                </div>
+              )}
             </div>
           </div>
         </div>,

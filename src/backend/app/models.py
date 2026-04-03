@@ -52,6 +52,12 @@ class NodeStatus(str, Enum):
     ISSUE = "issue"
 
 
+class RevisionStatus(str, Enum):
+    PENDING = "pending"
+    APPLIED = "applied"
+    FAILED = "failed"
+
+
 class SourceTableSpec(BaseModel):
     id: str
     name: str
@@ -166,6 +172,32 @@ class WarningItem(BaseModel):
     source: str = "heuristic"
 
 
+class PipelineOutlineItem(BaseModel):
+    step_id: str
+    title: str
+    operator: OperatorType
+    inputs: list[str] = Field(default_factory=list)
+    output_table: str
+    row_count: int | None = None
+    columns: list[str] = Field(default_factory=list)
+    added_columns: list[str] = Field(default_factory=list)
+    removed_columns: list[str] = Field(default_factory=list)
+    renamed_columns: dict[str, str] = Field(default_factory=dict)
+
+
+class ReviewSnapshot(BaseModel):
+    candidate_id: str
+    candidate_source: str
+    summary: str = ""
+    selected_node_id: str
+    selected_node_assessment: NodeAssessment | None = None
+    selected_node_warning_items: list[WarningItem] = Field(default_factory=list)
+    selected_step_preview: StepPreview | None = None
+    pipeline_outline: list[PipelineOutlineItem] = Field(default_factory=list)
+    final_preview_rows: list[dict[str, Any]] = Field(default_factory=list)
+    validation_summary: ValidationSummary
+
+
 class CandidatePipeline(BaseModel):
     id: str
     pipeline_spec: PipelineSpec
@@ -180,13 +212,21 @@ class CandidatePipeline(BaseModel):
     node_assessments: list[NodeAssessment] = Field(default_factory=list)
     created_at: datetime
     source: str = "heuristic"
+    parent_candidate_id: str | None = None
 
 
-class FeedbackItem(BaseModel):
+class RevisionRecord(BaseModel):
     id: str
     text: str
-    candidate_id: str
+    node_id: str
+    base_candidate_id: str
+    revised_candidate_id: str | None = None
+    status: RevisionStatus = RevisionStatus.PENDING
+    before_snapshot: ReviewSnapshot
+    after_snapshot: ReviewSnapshot | None = None
     created_at: datetime
+    completed_at: datetime | None = None
+    error: str | None = None
 
 
 class Session(BaseModel):
@@ -206,7 +246,7 @@ class Session(BaseModel):
     candidates: list[CandidatePipeline] = Field(default_factory=list)
     selected_candidate_id: str | None = None
     accepted_candidate_id: str | None = None
-    feedback_history: list[FeedbackItem] = Field(default_factory=list)
+    revision_history: list[RevisionRecord] = Field(default_factory=list)
     last_error: str = ""
 
     @computed_field  # type: ignore[misc]

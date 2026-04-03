@@ -18,10 +18,13 @@ from app.models import (
     AcceptPayload,
     CandidatePipeline,
     CreateTargetTablePayload,
-    FeedbackItem,
     FeedbackPayload,
     GenerationStatusResponse,
+    PipelineOutlineItem,
     OutputResponse,
+    RevisionRecord,
+    RevisionStatus,
+    ReviewSnapshot,
     Session,
     SessionStatus,
     SessionSummary,
@@ -121,6 +124,7 @@ def _reset_candidates(session: Session) -> None:
     session.candidates = []
     session.selected_candidate_id = None
     session.accepted_candidate_id = None
+    session.revision_history = []
 
 
 def _candidate_by_id(session: Session, candidate_id: str) -> CandidatePipeline:
@@ -128,6 +132,57 @@ def _candidate_by_id(session: Session, candidate_id: str) -> CandidatePipeline:
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
     return candidate
+
+
+def _revision_by_id(session: Session, revision_id: str) -> RevisionRecord:
+    revision = next((item for item in session.revision_history if item.id == revision_id), None)
+    if revision is None:
+        raise HTTPException(status_code=404, detail="Revision record not found")
+    return revision
+
+
+def _build_pipeline_outline(candidate: CandidatePipeline) -> list[PipelineOutlineItem]:
+    preview_by_step_id = {preview.step_id: preview for preview in candidate.step_previews}
+    outline: list[PipelineOutlineItem] = []
+    for step in candidate.pipeline_spec.steps:
+        preview = preview_by_step_id.get(step.step_id)
+        outline.append(
+            PipelineOutlineItem(
+                step_id=step.step_id,
+                title=step.title,
+                operator=step.operator,
+                inputs=list(step.inputs),
+                output_table=step.output,
+                row_count=preview.row_count if preview else None,
+                columns=list(preview.columns) if preview else [],
+                added_columns=list(preview.added_columns) if preview else [],
+                removed_columns=list(preview.removed_columns) if preview else [],
+                renamed_columns=dict(preview.renamed_columns) if preview else {},
+            )
+        )
+    return outline
+
+
+def _build_review_snapshot(candidate: CandidatePipeline, node_id: str) -> ReviewSnapshot:
+    selected_assessment = next((item for item in candidate.node_assessments if item.node_id == node_id), None)
+    selected_step_preview = next((item for item in candidate.step_previews if item.step_id == node_id), None)
+    selected_warning_items = [
+        item
+        for item in candidate.warning_items
+        if node_id in item.node_ids
+    ]
+    return ReviewSnapshot(
+        candidate_id=candidate.id,
+        candidate_source=candidate.source,
+        summary=candidate.summary,
+        selected_node_id=node_id,
+        selected_node_assessment=selected_assessment,
+        selected_node_warning_items=selected_warning_items,
+        selected_step_preview=selected_step_preview,
+        pipeline_outline=_build_pipeline_outline(candidate),
+        final_preview_rows=candidate.final_preview_rows[:3],
+        validation_summary=candidate.validation_summary,
+    )
 
 
 def _normalize_target_table_payload(payload: CreateTargetTablePayload) -> tuple[str, str, list[TargetFieldSpec], list[dict[str, object]]]:
@@ -161,7 +216,14 @@ def _normalize_target_table_payload(payload: CreateTargetTablePayload) -> tuple[
     return table_name, payload.description.strip(), cleaned_schema, normalized_rows
 
 
-async def _build_candidate(session: Session, spec, source: str) -> CandidatePipeline:
+async def _build_candidate(
+    session: Session,
+    spec,
+    source: str,
+    *,
+    parent_candidate_id: str | None = None,
+    revision_record: RevisionRecord | None = None,
+) -> CandidatePipeline:
     step_previews, final_preview_rows, final_df = executor.execute(session, spec)
     validation = validator.validate(final_df, session.target_schema, session.target_samples, warnings=list(spec.warnings))
     candidate = CandidatePipeline(
@@ -175,11 +237,16 @@ async def _build_candidate(session: Session, spec, source: str) -> CandidatePipe
         suggestions=[],
         created_at=now_utc(),
         source=source,
+        parent_candidate_id=parent_candidate_id,
     )
     candidate = await diagnosis_service.enrich_candidate(session, candidate)
+    candidate = await explanation_service.enrich_candidate(session, candidate)
+    if revision_record is not None:
+        provisional_after_snapshot = _build_review_snapshot(candidate, revision_record.node_id)
+        candidate = await diagnosis_service.reconcile_revision(session, candidate, revision_record, provisional_after_snapshot)
+        candidate = await explanation_service.enrich_candidate(session, candidate)
     candidate.suggestions = suggestion_service.build(session, candidate)
     candidate.score = _score_candidate(candidate)
-    candidate = await explanation_service.enrich_candidate(session, candidate)
     return candidate
 
 
@@ -248,19 +315,35 @@ async def _generate_for_session(session_id: str, revising: bool = False) -> None
         active_generation_tasks.pop(session_id, None)
 
 
-async def _revise_for_session(session_id: str, candidate_id: str, node_id: str, text: str) -> None:
+async def _revise_for_session(session_id: str, revision_id: str, candidate_id: str, node_id: str, text: str) -> None:
     session = _ensure_session(session_id)
+    revision_record = _revision_by_id(session, revision_id)
     try:
         base_candidate = _candidate_by_id(session, candidate_id)
         revised_spec = await revision_service.revise(session, base_candidate, node_id, text)
-        revised_candidate = await _build_candidate(session, revised_spec, "llm_revision")
+        revised_candidate = await _build_candidate(
+            session,
+            revised_spec,
+            "llm_revision",
+            parent_candidate_id=base_candidate.id,
+            revision_record=revision_record,
+        )
         session.candidates = [revised_candidate] + [candidate for candidate in session.candidates if candidate.id != candidate_id]
         session.selected_candidate_id = revised_candidate.id
         session.accepted_candidate_id = None
+        revision_record.revised_candidate_id = revised_candidate.id
+        revision_record.after_snapshot = _build_review_snapshot(revised_candidate, revision_record.node_id)
+        revision_record.status = RevisionStatus.APPLIED
+        revision_record.completed_at = now_utc()
+        revision_record.error = None
         session.last_error = ""
         session.status = SessionStatus.REVIEW_READY
         session.status_message = "Review updated from your feedback."
     except Exception as exc:
+        revision_record.status = RevisionStatus.FAILED
+        revision_record.after_snapshot = None
+        revision_record.completed_at = now_utc()
+        revision_record.error = str(exc)
         session.status = SessionStatus.ERROR
         session.status_message = "Revision failed."
         session.last_error = str(exc)
@@ -484,19 +567,25 @@ async def get_candidate(session_id: str, candidate_id: str) -> CandidatePipeline
 @router.post("/{session_id}/feedback", response_model=SessionSummary)
 async def apply_feedback(session_id: str, payload: FeedbackPayload) -> SessionSummary:
     session = _ensure_session(session_id)
-    _candidate_by_id(session, payload.candidate_id)
+    candidate = _candidate_by_id(session, payload.candidate_id)
     if session_id in active_generation_tasks:
         return _session_summary(session)
-    session.feedback_history = (
-        session.feedback_history
-        + [FeedbackItem(id=new_id("feedback"), text=payload.text, candidate_id=payload.candidate_id, created_at=now_utc())]
-    )[-3:]
+    revision_record = RevisionRecord(
+        id=new_id("revision"),
+        text=payload.text,
+        node_id=payload.node_id,
+        base_candidate_id=payload.candidate_id,
+        status=RevisionStatus.PENDING,
+        before_snapshot=_build_review_snapshot(candidate, payload.node_id),
+        created_at=now_utc(),
+    )
+    session.revision_history = session.revision_history + [revision_record]
     session.accepted_candidate_id = None
     session.status = SessionStatus.REVISING
     session.status_message = "Revising pipeline from your feedback."
     session.last_error = ""
     storage.save(session)
-    task = asyncio.create_task(_revise_for_session(session_id, payload.candidate_id, payload.node_id, payload.text))
+    task = asyncio.create_task(_revise_for_session(session_id, revision_record.id, payload.candidate_id, payload.node_id, payload.text))
     active_generation_tasks[session_id] = task
     return _session_summary(session)
 

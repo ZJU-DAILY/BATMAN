@@ -38,40 +38,32 @@ class LLMClient:
     ) -> list[str]:
         if not self.enabled:
             return []
+        target_model = (model or settings.generation_model).strip()
+        if not target_model:
+            return []
         headers = {"Authorization": f"Bearer {settings.api_key}"}
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         async with httpx.AsyncClient(base_url=settings.api_base_url, timeout=settings.timeout_seconds) as client:
-            for candidate_model in self._candidate_models(model):
-                payload = {
-                    "model": candidate_model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "top_p": top_p if top_p is not None else 0.8,
-                    "n": n,
-                    "max_tokens": settings.max_completion_tokens,
-                }
-                try:
-                    response = await client.post("/chat/completions", headers=headers, json=payload)
-                    response.raise_for_status()
-                except Exception:
-                    continue
-                contents = self._usable_contents(response.json())
-                if contents:
-                    return contents[:n]
+            payload = {
+                "model": target_model,
+                "messages": messages,
+                "temperature": temperature,
+                "top_p": top_p if top_p is not None else 0.8,
+                "n": n,
+                "max_tokens": settings.max_completion_tokens,
+            }
+            try:
+                response = await client.post("/chat/completions", headers=headers, json=payload)
+                response.raise_for_status()
+            except Exception:
+                return []
+            contents = self._usable_contents(response.json())
+            if contents:
+                return contents[:n]
         return []
-
-    def _candidate_models(self, requested_model: str | None) -> list[str]:
-        primary = (requested_model or settings.effective_explanation_model).strip()
-        models = [primary, *settings.fallback_models]
-        unique: list[str] = []
-        for item in models:
-            name = item.strip()
-            if name and name not in unique:
-                unique.append(name)
-        return unique
 
     def _usable_contents(self, body: dict[str, object]) -> list[str]:
         contents: list[str] = []

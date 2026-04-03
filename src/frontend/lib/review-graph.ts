@@ -17,7 +17,7 @@ export type ReviewDisplayNode = {
   explanation: string;
   assessmentReason: string;
   previewRows: Record<string, unknown>[];
-  anchorStepId: string;
+  editableStepId: string | null;
   coveredStepIds: string[];
   previewStepId: string | null;
   detailLines: string[];
@@ -46,6 +46,7 @@ type ReviewGraphContext = {
   sourceTableById: Map<string, SourceTableSpec>;
   rawParentsByStepId: Map<string, string[]>;
   rawChildrenByStepId: Map<string, string[]>;
+  directSourceTableNamesByStepId: Map<string, string[]>;
   rawIndexByStepId: Map<string, number>;
   assessmentByNodeId: Map<string, NodeAssessment>;
   finalProducerId: string | null;
@@ -289,17 +290,23 @@ function arraysEqual(left: string[], right: string[]) {
 function buildRawContext(session: Session, candidate: CandidatePipeline): ReviewGraphContext {
   const allSteps = candidate.pipeline_spec.steps;
   const rawParentsAll = new Map<string, string[]>();
+  const directSourceTableNamesAll = new Map<string, string[]>();
   const latestProducerByOutput = new Map<string, string>();
+  const sourceTableNames = new Set(session.source_tables.map((table) => table.name));
 
   allSteps.forEach((step) => {
     const parents: string[] = [];
+    const directSources: string[] = [];
     step.inputs.forEach((input) => {
       const producerId = latestProducerByOutput.get(input);
       if (producerId) {
         parents.push(producerId);
+      } else if (sourceTableNames.has(input)) {
+        directSources.push(input);
       }
     });
     rawParentsAll.set(step.step_id, Array.from(new Set(parents)));
+    directSourceTableNamesAll.set(step.step_id, Array.from(new Set(directSources)));
     latestProducerByOutput.set(step.output, step.step_id);
   });
 
@@ -320,6 +327,7 @@ function buildRawContext(session: Session, candidate: CandidatePipeline): Review
   const orderedSteps = allSteps.filter((step) => usedStepIds.has(step.step_id));
   const rawParentsByStepId = new Map<string, string[]>();
   const rawChildrenByStepId = new Map<string, string[]>();
+  const directSourceTableNamesByStepId = new Map<string, string[]>();
 
   orderedSteps.forEach((step) => {
     rawChildrenByStepId.set(step.step_id, []);
@@ -328,6 +336,7 @@ function buildRawContext(session: Session, candidate: CandidatePipeline): Review
   orderedSteps.forEach((step) => {
     const parents = (rawParentsAll.get(step.step_id) ?? []).filter((parentId) => usedStepIds.has(parentId));
     rawParentsByStepId.set(step.step_id, parents);
+    directSourceTableNamesByStepId.set(step.step_id, directSourceTableNamesAll.get(step.step_id) ?? []);
     parents.forEach((parentId) => {
       const children = rawChildrenByStepId.get(parentId) ?? [];
       children.push(step.step_id);
@@ -345,6 +354,7 @@ function buildRawContext(session: Session, candidate: CandidatePipeline): Review
     sourceTableById: new Map(session.source_tables.map((table) => [table.id, table] as const)),
     rawParentsByStepId,
     rawChildrenByStepId,
+    directSourceTableNamesByStepId,
     rawIndexByStepId: new Map(orderedSteps.map((step, index) => [step.step_id, index] as const)),
     assessmentByNodeId: new Map((candidate.node_assessments ?? []).map((item) => [item.node_id, item] as const)),
     finalProducerId
@@ -354,7 +364,11 @@ function buildRawContext(session: Session, candidate: CandidatePipeline): Review
 function inputColumnsForStep(step: PipelineStep, context: ReviewGraphContext) {
   const parentId = (context.rawParentsByStepId.get(step.step_id) ?? [])[0];
   if (!parentId) {
-    return [];
+    const sourceName = (context.directSourceTableNamesByStepId.get(step.step_id) ?? [])[0];
+    if (!sourceName) {
+      return [];
+    }
+    return context.sourceTableByName.get(sourceName)?.columns ?? [];
   }
   const parentPreview = context.stepPreviewById.get(parentId);
   if (parentPreview?.columns?.length) {
@@ -455,8 +469,7 @@ function explanationForNode(
   return fallbackExplanation(kind, step, label);
 }
 
-function detailsForInput(step: PipelineStep, sourceTable: SourceTableSpec | undefined, statsLine: string) {
-  const sourceName = sourceTable?.name ?? asStringValue(step.params.source_table) ?? step.output;
+function detailsForInput(sourceName: string, sourceTable: SourceTableSpec | undefined, statsLine: string) {
   const details = [`Starting table: ${quote(sourceName)}`];
   if (statsLine) {
     details.push(`Current shape: ${statsLine}`);
@@ -720,6 +733,10 @@ function collectParentDisplayIds(
   return Array.from(results);
 }
 
+function syntheticSourceNodeId(sourceTable: SourceTableSpec | undefined, sourceName: string) {
+  return `node_source_${normalizeIdentifier(sourceTable?.id ?? sourceName)}`;
+}
+
 export function buildReviewDisplayGraph(session: Session | null, candidate: CandidatePipeline | null): ReviewDisplayGraph {
   if (!session || !candidate) {
     return { nodes: [], edges: [], displayNodeIdByRawNodeId: {} };
@@ -763,6 +780,43 @@ export function buildReviewDisplayGraph(session: Session | null, candidate: Cand
   });
 
   const nodes: ReviewDisplayNode[] = [];
+  const sourceDisplayNodeIdByName = new Map<string, string>();
+  const explicitSourceStepIdByName = new Map<string, string>();
+
+  context.orderedSteps.forEach((step) => {
+    if (!visibleStepIds.has(step.step_id) || step.operator !== "source_table") {
+      return;
+    }
+    const sourceName = asStringValue(step.params.source_table) ?? step.output;
+    if (sourceName) {
+      explicitSourceStepIdByName.set(sourceName, step.step_id);
+    }
+  });
+
+  const syntheticSourceEntries = Array.from(
+    context.orderedSteps.reduce((accumulator, step) => {
+      const targetDisplayId = displayNodeIdByRawNodeId[step.step_id];
+      if (!targetDisplayId) {
+        return accumulator;
+      }
+      (context.directSourceTableNamesByStepId.get(step.step_id) ?? []).forEach((sourceName) => {
+        if (explicitSourceStepIdByName.has(sourceName)) {
+          return;
+        }
+        const sourceTable = context.sourceTableByName.get(sourceName);
+        if (!sourceTable) {
+          return;
+        }
+        const existing = accumulator.get(sourceName);
+        const stepIndex = context.rawIndexByStepId.get(step.step_id) ?? Number.MAX_SAFE_INTEGER;
+        if (!existing || stepIndex < existing.firstConsumerIndex) {
+          accumulator.set(sourceName, { sourceTable, firstConsumerIndex: stepIndex });
+        }
+      });
+      return accumulator;
+    }, new Map<string, { sourceTable: SourceTableSpec; firstConsumerIndex: number }>())
+  ).sort((left, right) => left[1].firstConsumerIndex - right[1].firstConsumerIndex);
+
   context.orderedSteps.forEach((step) => {
     if (!visibleStepIds.has(step.step_id)) {
       return;
@@ -790,12 +844,45 @@ export function buildReviewDisplayGraph(session: Session | null, candidate: Cand
         explanation: explanationForNode("input", step, label, candidate, step.step_id),
         assessmentReason: reason,
         previewRows: sourceTable?.preview_rows ?? preview?.preview_rows ?? [],
-        anchorStepId: step.step_id,
+        editableStepId: null,
         coveredStepIds,
         previewStepId: step.step_id,
-        detailLines: detailsForInput(step, sourceTable, statsLine),
+        detailLines: detailsForInput(sourceName, sourceTable, statsLine),
         sourceTable
       });
+      sourceDisplayNodeIdByName.set(sourceName, step.step_id);
+      return;
+    }
+  });
+
+  syntheticSourceEntries.forEach(([sourceName, entry]) => {
+    const sourceTable = entry.sourceTable;
+    const label = sourceTable.name;
+    const subtitle = displayTableKind("input");
+    const statsLine = displayStatsLine(sourceTable.row_count, sourceTable.columns.length);
+    const { status, reason } = statusAndReason("input", label, [], context);
+    const nodeId = syntheticSourceNodeId(sourceTable, sourceName);
+    nodes.push({
+      id: nodeId,
+      kind: "input",
+      label,
+      subtitle,
+      statsLine,
+      status,
+      explanation: fallbackExplanation("input", null, label),
+      assessmentReason: reason,
+      previewRows: sourceTable.preview_rows ?? [],
+      editableStepId: null,
+      coveredStepIds: [],
+      previewStepId: null,
+      detailLines: detailsForInput(sourceName, sourceTable, statsLine),
+      sourceTable
+    });
+    sourceDisplayNodeIdByName.set(sourceName, nodeId);
+  });
+
+  context.orderedSteps.forEach((step) => {
+    if (!visibleStepIds.has(step.step_id) || step.operator === "source_table") {
       return;
     }
 
@@ -803,7 +890,6 @@ export function buildReviewDisplayGraph(session: Session | null, candidate: Cand
     const coveredStepIds = step.operator === "join"
       ? sortStepIds([...(absorbedByJoinStep.get(step.step_id) ?? []), step.step_id], context.rawIndexByStepId)
       : [step.step_id];
-    const anchorStepId = coveredStepIds[0] ?? step.step_id;
     const label = displayLabelForStep(step);
     const subtitle = displayTableKind("step");
     const statsLine = displayStatsLine(preview?.row_count, preview?.columns.length);
@@ -819,7 +905,7 @@ export function buildReviewDisplayGraph(session: Session | null, candidate: Cand
       explanation: explanationForNode("step", step, label, candidate, step.step_id),
       assessmentReason: reason,
       previewRows: preview?.preview_rows ?? [],
-      anchorStepId,
+      editableStepId: step.step_id,
       coveredStepIds,
       previewStepId: step.step_id,
       detailLines: detailsForStep(step, preview, context)
@@ -833,7 +919,6 @@ export function buildReviewDisplayGraph(session: Session | null, candidate: Cand
     candidate.validation_summary.row_count ?? candidate.final_preview_rows.length,
     candidate.validation_summary.column_count ?? Object.keys(candidate.final_preview_rows[0] ?? {}).length
   );
-  const outputAnchorStepId = context.finalProducerId ?? context.orderedSteps[context.orderedSteps.length - 1]?.step_id ?? "node_output";
   const outputStatus = statusAndReason("output", outputLabel, outputCoveredNodeIds, context);
   nodes.push({
     id: "node_output",
@@ -845,7 +930,7 @@ export function buildReviewDisplayGraph(session: Session | null, candidate: Cand
     explanation: explanationForNode("output", null, outputLabel, candidate, "node_output"),
     assessmentReason: outputStatus.reason,
     previewRows: candidate.final_preview_rows,
-    anchorStepId: outputAnchorStepId,
+    editableStepId: null,
     coveredStepIds: outputCoveredNodeIds,
     previewStepId: context.finalProducerId,
     detailLines: detailsForOutput(outputStatsLine)
@@ -854,6 +939,32 @@ export function buildReviewDisplayGraph(session: Session | null, candidate: Cand
 
   const edges: ReviewDisplayEdge[] = [];
   const seenEdgeIds = new Set<string>();
+  const addEdge = (from: string, to: string) => {
+    const edgeId = `${from}->${to}`;
+    if (from === to || seenEdgeIds.has(edgeId)) {
+      return;
+    }
+    seenEdgeIds.add(edgeId);
+    edges.push({
+      id: edgeId,
+      from,
+      to
+    });
+  };
+
+  context.orderedSteps.forEach((step) => {
+    const targetDisplayId = displayNodeIdByRawNodeId[step.step_id];
+    if (!targetDisplayId) {
+      return;
+    }
+    (context.directSourceTableNamesByStepId.get(step.step_id) ?? []).forEach((sourceName) => {
+      const sourceDisplayId = sourceDisplayNodeIdByName.get(sourceName);
+      if (sourceDisplayId) {
+        addEdge(sourceDisplayId, targetDisplayId);
+      }
+    });
+  });
+
   nodes.forEach((node) => {
     if (node.kind === "input") {
       return;
@@ -871,16 +982,8 @@ export function buildReviewDisplayGraph(session: Session | null, candidate: Cand
     }
 
     Array.from(new Set(parentDisplayIds)).forEach((parentDisplayId, index) => {
-      const edgeId = `${parentDisplayId}->${node.id}-${index}`;
-      if (seenEdgeIds.has(edgeId)) {
-        return;
-      }
-      seenEdgeIds.add(edgeId);
-      edges.push({
-        id: edgeId,
-        from: parentDisplayId,
-        to: node.id
-      });
+      void index;
+      addEdge(parentDisplayId, node.id);
     });
   });
 

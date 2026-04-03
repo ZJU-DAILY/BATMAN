@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
+from app.config import settings
 from app.engine.utils import new_id
-from app.models import CandidatePipeline, NodeAssessment, NodeStatus, Session, WarningItem
+from app.models import CandidatePipeline, NodeAssessment, NodeStatus, RevisionRecord, ReviewSnapshot, Session, WarningItem
 from app.services.llm_client import llm_client
 
 
@@ -21,12 +23,47 @@ class DiagnosisService:
         candidate.node_assessments = self._node_assessments(candidate, warning_items)
         return candidate
 
+    async def reconcile_revision(
+        self,
+        session: Session,
+        candidate: CandidatePipeline,
+        revision_record: RevisionRecord,
+        after_snapshot: ReviewSnapshot,
+    ) -> CandidatePipeline:
+        if not llm_client.enabled:
+            return candidate
+
+        draft_ambiguity_warnings = [item for item in candidate.warning_items if item.source == "ambiguity"]
+        if not draft_ambiguity_warnings:
+            return candidate
+
+        payload = await self._generate_reconciled_warning_items(
+            session,
+            candidate,
+            revision_record,
+            after_snapshot,
+            draft_ambiguity_warnings,
+        )
+        if not payload:
+            return candidate
+
+        reconciled_ambiguity_items = self._parse_reconciled_warning_items(payload, candidate)
+        if reconciled_ambiguity_items is None:
+            return candidate
+        reconciled_ambiguity_items = self._filter_reconciled_ambiguity_items(revision_record, reconciled_ambiguity_items)
+
+        non_ambiguity_items = [item for item in candidate.warning_items if item.source != "ambiguity"]
+        candidate.warning_items = self._merge_warning_items(non_ambiguity_items, reconciled_ambiguity_items)
+        candidate.node_assessments = self._node_assessments(candidate, candidate.warning_items)
+        return candidate
+
     async def _generate_warning_items(self, session: Session, candidate: CandidatePipeline) -> dict[str, Any] | None:
         if not llm_client.enabled:
             return None
 
         response = await llm_client.complete_text(
             prompt=self._prompt(session, candidate),
+            model=settings.explanation_model,
             temperature=max(0.05, session.settings.bat_temperature),
             top_p=session.settings.bat_top_p,
             system_prompt=(
@@ -34,6 +71,36 @@ class DiagnosisService:
                 "Use the final validation result and step-level previews to produce concise warning items. "
                 "You may report either concrete data-quality problems or business-semantics ambiguities that still need human confirmation. "
                 "Do not mark the input node as problematic. "
+                "Return valid JSON only."
+            ),
+        )
+        if not response:
+            return None
+        return self._parse_json_payload(response)
+
+    async def _generate_reconciled_warning_items(
+        self,
+        session: Session,
+        candidate: CandidatePipeline,
+        revision_record: RevisionRecord,
+        after_snapshot: ReviewSnapshot,
+        draft_ambiguity_warnings: list[WarningItem],
+    ) -> dict[str, Any] | None:
+        response = await llm_client.complete_text(
+            prompt=self._revision_reconciliation_prompt(
+                session,
+                candidate,
+                revision_record,
+                after_snapshot,
+                draft_ambiguity_warnings,
+            ),
+            model=settings.explanation_model,
+            temperature=max(0.05, session.settings.bat_temperature),
+            top_p=session.settings.bat_top_p,
+            system_prompt=(
+                "You decide whether ambiguity warnings are still valid after a user-requested revision. "
+                "Compare the before and after snapshots carefully. "
+                "Only keep ambiguity warnings that are still genuinely unresolved in the revised candidate. "
                 "Return valid JSON only."
             ),
         )
@@ -191,8 +258,6 @@ class DiagnosisService:
             "- If validation_summary.pipeline_correct is true, only return ambiguity-style confirmation warnings. Do not invent concrete failures that are not supported by validation.\n"
             "- For executable pipelines, prefer 0 to 2 warnings and focus only on the most important user-facing uncertainties.\n"
             "- Prefer a single strongest warning over several weak warnings when one business choice dominates the uncertainty.\n"
-            "- If recent user feedback clearly resolved a business ambiguity and the revised pipeline follows that instruction, do not repeat the same confirmation warning.\n"
-            "- If recent user feedback says to use one named source value instead of another and the revised pipeline now follows that instruction, treat that ambiguity as resolved unless the new output contradicts it.\n"
             "- Use source=\"ambiguity\" for low-confidence business choices that still need confirmation.\n"
             "- Use source=\"validation\" for concrete output problems such as missing fields, bad value formats, or execution issues.\n"
             "- If the pipeline looks both structurally correct and semantically unambiguous, return an empty warnings array.\n"
@@ -211,11 +276,45 @@ class DiagnosisService:
             f"Target schema: {json.dumps([field.model_dump(mode='json') for field in session.target_schema], ensure_ascii=True)}\n"
             f"Existing target rows: {json.dumps(session.target_samples[:3], ensure_ascii=True, default=str)}\n"
             f"Validation summary: {json.dumps(validation, ensure_ascii=True, default=str)}\n"
-            f"Recent user feedback: {json.dumps([item.model_dump(mode='json') for item in session.feedback_history[-3:]], ensure_ascii=True, default=str)}\n"
             f"Candidate source: {json.dumps(candidate.source, ensure_ascii=True, default=str)}\n"
             f"Pipeline rationale: {json.dumps(candidate.pipeline_spec.rationale, ensure_ascii=True, default=str)}\n"
             f"Pipeline steps: {json.dumps(step_lines, ensure_ascii=True, default=str)}\n"
             f"Final output preview: {json.dumps(candidate.final_preview_rows[:3], ensure_ascii=True, default=str)}\n"
+        )
+
+    def _revision_reconciliation_prompt(
+        self,
+        session: Session,
+        candidate: CandidatePipeline,
+        revision_record: RevisionRecord,
+        after_snapshot: ReviewSnapshot,
+        draft_ambiguity_warnings: list[WarningItem],
+    ) -> str:
+        return (
+            "Reconcile ambiguity warnings after a user-requested revision.\n"
+            "Rules:\n"
+            "- Compare the before and after snapshots carefully.\n"
+            "- This is a scoped reconciliation pass, not a fresh open-ended diagnosis pass.\n"
+            "- The user feedback describes the intended business correction.\n"
+            "- Start from the ambiguity that motivated the revision and decide whether that ambiguity cluster still remains.\n"
+            "- Keep an ambiguity warning only if the revised candidate still leaves that same business uncertainty unresolved.\n"
+            "- If the revised candidate clearly implements the user's requested business choice, remove the corresponding ambiguity warning.\n"
+            "- Do not introduce unrelated new ambiguity warnings that were not part of the user's requested correction, even if they could be debated in isolation.\n"
+            "- Only surface a new ambiguity warning if it is a direct continuation or restatement of the same business choice the user just revised.\n"
+            "- Do not treat changed wording, summaries, or explanations as evidence by themselves. Judge the actual step previews, validation summary, and output preview.\n"
+            "- You may rewrite the remaining ambiguity warnings so they match the revised candidate.\n"
+            "- If the revised candidate is structurally correct and clearly follows the user instruction, prefer an empty warnings array over inventing a replacement confirmation warning.\n"
+            "- Only decide ambiguity warnings. Do not recreate validation or execution warnings here.\n"
+            "- Return JSON only in this shape:\n"
+            '{"warnings": [{"title": "short title", "detail": "one sentence", "node_ids": ["step_2", "node_output"], "source": "ambiguity"}]}\n\n'
+            f"User feedback: {json.dumps(revision_record.text, ensure_ascii=True, default=str)}\n"
+            f"Selected node id: {json.dumps(revision_record.node_id, ensure_ascii=True, default=str)}\n"
+            f"Before snapshot: {json.dumps(revision_record.before_snapshot.model_dump(mode='json'), ensure_ascii=True, default=str)}\n"
+            f"After snapshot: {json.dumps(after_snapshot.model_dump(mode='json'), ensure_ascii=True, default=str)}\n"
+            f"Original selected-node ambiguity warnings: {json.dumps([item.model_dump(mode='json') for item in revision_record.before_snapshot.selected_node_warning_items], ensure_ascii=True, default=str)}\n"
+            f"Draft ambiguity warnings: {json.dumps([item.model_dump(mode='json') for item in draft_ambiguity_warnings], ensure_ascii=True, default=str)}\n"
+            f"Current candidate source: {json.dumps(candidate.source, ensure_ascii=True, default=str)}\n"
+            f"Target schema: {json.dumps([field.model_dump(mode='json') for field in session.target_schema], ensure_ascii=True)}\n"
         )
 
     def _parse_warning_items(self, payload: dict[str, Any], candidate: CandidatePipeline) -> list[WarningItem]:
@@ -250,6 +349,68 @@ class DiagnosisService:
             )
         return items[:4]
 
+    def _filter_reconciled_ambiguity_items(
+        self,
+        revision_record: RevisionRecord,
+        items: list[WarningItem],
+    ) -> list[WarningItem]:
+        if not items:
+            return items
+
+        scope_node_ids = {revision_record.node_id, "node_output"}
+        scope_terms = self._warning_scope_terms(revision_record.text)
+        for warning in revision_record.before_snapshot.selected_node_warning_items:
+            scope_node_ids.update(warning.node_ids)
+            scope_terms.update(self._warning_scope_terms(warning.title))
+            scope_terms.update(self._warning_scope_terms(warning.detail))
+
+        if not scope_terms:
+            return items[:4]
+
+        filtered: list[WarningItem] = []
+        for item in items:
+            if scope_node_ids.intersection(item.node_ids):
+                filtered.append(item)
+                continue
+
+            item_terms = self._warning_scope_terms(f"{item.title} {item.detail}")
+            if scope_terms.intersection(item_terms):
+                filtered.append(item)
+
+        return filtered[:4]
+
+    def _parse_reconciled_warning_items(
+        self,
+        payload: dict[str, Any],
+        candidate: CandidatePipeline,
+    ) -> list[WarningItem] | None:
+        if not isinstance(payload, dict):
+            return None
+        raw_items = payload.get("warnings", [])
+        if not isinstance(raw_items, list):
+            return None
+        valid_node_ids = {preview.step_id for preview in candidate.step_previews} | {"node_output"}
+        items: list[WarningItem] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            title = str(raw.get("title", "")).strip()
+            if not title:
+                continue
+            node_ids = [node_id for node_id in raw.get("node_ids", []) if isinstance(node_id, str) and node_id in valid_node_ids]
+            if not node_ids:
+                node_ids = self._last_step_node_ids(candidate)
+            items.append(
+                WarningItem(
+                    id=new_id("warning"),
+                    title=title,
+                    detail=str(raw.get("detail", "")).strip(),
+                    node_ids=node_ids,
+                    source="ambiguity",
+                )
+            )
+        return items[:4]
+
     def _infer_warning_source(self, title: str, detail: str) -> str:
         text = f"{title} {detail}".lower()
         ambiguity_markers = (
@@ -263,12 +424,23 @@ class DiagnosisService:
             "business meaning",
             "business choice",
         )
-        return "ambiguity" if any(marker in text for marker in ambiguity_markers) else "llm"
+        validation_markers = (
+            "missing",
+            "wrong value format",
+            "type mismatch",
+            "execution failed",
+            "usable output",
+        )
+        if any(marker in text for marker in ambiguity_markers):
+            return "ambiguity"
+        if any(marker in text for marker in validation_markers):
+            return "validation"
+        return "llm"
 
-    def _merge_warning_items(self, primary: list[WarningItem], fallback: list[WarningItem]) -> list[WarningItem]:
+    def _merge_warning_items(self, primary: list[WarningItem], secondary: list[WarningItem]) -> list[WarningItem]:
         merged: list[WarningItem] = []
         seen: set[tuple[str, str, tuple[str, ...], str]] = set()
-        for item in [*primary, *fallback]:
+        for item in [*primary, *secondary]:
             key = (
                 item.title.strip().lower(),
                 item.detail.strip().lower(),
@@ -291,6 +463,50 @@ class DiagnosisService:
         except Exception:
             return None
         return payload if isinstance(payload, dict) else None
+
+    def _warning_scope_terms(self, text: str) -> set[str]:
+        stopwords = {
+            "the",
+            "and",
+            "for",
+            "with",
+            "that",
+            "this",
+            "from",
+            "into",
+            "your",
+            "user",
+            "step",
+            "steps",
+            "pipeline",
+            "selected",
+            "current",
+            "revised",
+            "candidate",
+            "business",
+            "choice",
+            "confirm",
+            "confirmation",
+            "needs",
+            "need",
+            "please",
+            "should",
+            "still",
+            "correct",
+            "output",
+            "field",
+            "fields",
+            "mapping",
+            "report",
+            "table",
+            "tables",
+            "daily",
+        }
+        return {
+            token
+            for token in re.findall(r"[a-zA-Z0-9_]+", text.lower())
+            if len(token) > 2 and token not in stopwords
+        }
 
 
 diagnosis_service = DiagnosisService()
